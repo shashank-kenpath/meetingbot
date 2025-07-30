@@ -18,13 +18,21 @@ export function createS3Client(region: string | undefined, accessKeyId: string |
         // Create an S3 client with credentials if they are provided
         // Local Development requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
         if (accessKeyId && secretKey) {
-            return new S3Client({
+            const clientConfig: any = {
                 region,
                 credentials: {
                     accessKeyId: accessKeyId,
                     secretAccessKey: secretKey!,
                 },
-            });
+            };
+
+            // For local development with LocalStack
+            if (process.env.AWS_ENDPOINT) {
+                clientConfig.endpoint = process.env.AWS_ENDPOINT;
+                clientConfig.forcePathStyle = true;
+            }
+
+            return new S3Client(clientConfig);
 
             // Production
             // Credientials is not required on AWS, so we can use the default constructor.

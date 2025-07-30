@@ -117,6 +117,9 @@ export class MeetsBot extends Bot {
   recorder: PageVideoCapture | undefined;
   kicked: boolean = false;
   recordingPath: string;
+  recordingSegments: string[] = [];
+  currentSegment: number = 0;
+  segmentInterval: NodeJS.Timeout | null = null;
 
   private recordBuffer: Buffer[] = [];
   private startedRecording: boolean = false;
@@ -136,7 +139,10 @@ export class MeetsBot extends Bot {
     onEvent: (eventType: EventCode, data?: any) => Promise<void>
   ) {
     super(botSettings, onEvent);
-    this.recordingPath = path.resolve(__dirname, "recording.mp4");
+    this.recordingPath = path.resolve(__dirname, "recording.mp3");
+    this.recordingSegments = [];
+    this.currentSegment = 0;
+    this.segmentInterval = null;
 
     this.browserArgs = [
       "--incognito",
@@ -184,11 +190,26 @@ export class MeetsBot extends Bot {
   }
 
   /**
-   * Gets the video content type.
+   * Gets the current segment recording path
+   * @returns {string} - Returns the path to the current segment recording file.
+   */
+  getCurrentSegmentPath(): string {
+    const dir = path.dirname(this.recordingPath);
+    const segmentPath = path.join(dir, `recording_segment_${this.currentSegment.toString().padStart(3, '0')}.mp3`);
+    
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    return segmentPath;
+  }
+
+  /**
+   * Gets the audio content type.
    * @returns {string} - Returns the content type of the recording file.
    */
   getContentType(): string {
-    return "video/mp4";
+    return "audio/mpeg";
   }
 
   /**
@@ -332,85 +353,90 @@ export class MeetsBot extends Bot {
    * 
    */
   getFFmpegParams() {
-
-    // For Testing (pnpm test) -- no docker x11 server running.
+    const segmentPath = this.getCurrentSegmentPath();
+    
+    // For Testing (local development) - capture system audio on macOS
     if (!fs.existsSync('/tmp/.X11-unix')) {
-      console.log('Using test ffmpeg params')
+      console.log('Using macOS audio capture for MP3 segments')
       return [
-        '-y',
-        '-f', 'lavfi',
-        '-i', 'color=c=blue:s=1280x720:r=30',
-        '-video_size', '1280x720',
-        '-preset', 'ultrafast',
-        '-c:a', 'aac',
-        '-c:v', 'libx264',
-        this.getRecordingPath()
+        '-f', 'avfoundation',
+        '-i', ':0', // Use default audio input device
+        '-c:a', 'mp3',
+        '-b:a', '128k',
+        '-ar', '44100', // Sample rate
+        '-ac', '2', // Stereo
+        '-t', '60', // Record for 60 seconds (1 minute segment)
+        '-y', segmentPath
       ]
     }
 
-    // Creait to @martinezpl for these ffmpeg params.
-    console.log('Loading Dockerized FFMPEG Params ...')
+    // Audio-only recording for production (Linux/Docker)
+    console.log('Loading Dockerized FFMPEG Params for audio-only MP3 segments...')
 
-    const videoInputFormat = "x11grab";
     const audioInputFormat = "pulse";
-    const videoSource = ":99.0";
     const audioSource = "default";
     const audioBitrate = "128k";
-    const fps = "25";
 
     return [
       '-v', 'verbose', // Verbose logging for debugging
       "-thread_queue_size", "512", // Increase thread queue size to handle input buffering
-      "-video_size", `${SCREEN_WIDTH}x${SCREEN_HEIGHT}`, //full screen resolution
-      "-framerate", fps, // Lower frame rate to reduce CPU usage
-      "-f", videoInputFormat,
-      "-i", videoSource,
-      "-thread_queue_size", "512",
       "-f", audioInputFormat,
       "-i", audioSource,
-      "-c:v", "libx264", // H.264 codec for browser compatibility
-      "-pix_fmt", "yuv420p", // Ensures compatibility with most browsers
-      "-preset", "veryfast", // Use a faster preset to reduce CPU usage
-      "-crf", "28", // Increase CRF for reduced CPU usage
-      "-c:a", "aac", // AAC codec for audio compatibility
-      "-b:a", audioBitrate, // Lower audio bitrate for reduced CPU usage
-      "-vsync", "2", // Synchronize video and audio
-      "-vf", "scale=1280:720", // Ensure the video is scaled to 720p
-      "-y", this.getRecordingPath(), // Output file path
+      "-c:a", "mp3", // MP3 codec for audio
+      "-b:a", audioBitrate, // Audio bitrate
+      "-ar", "44100", // Sample rate
+      "-ac", "2", // Stereo
+      "-t", "60", // Record for 60 seconds (1 minute segment)
+      "-y", segmentPath // Output to current segment file
     ];
   }
 
   /**
-   * Starts the recording of the call using ffmpeg.
+   * Starts the recording of the call using ffmpeg with 1-minute segments.
    * 
-   * This function initializes an ffmpeg process to capture the screen and audio of the meeting.
-   * It ensures that only one recording process is active at a time and logs the status of the recording.
+   * This function initializes an ffmpeg process to capture audio from the meeting.
+   * It creates new segments every minute and maintains a list of all segments.
    * 
    * @returns {void}
    */
   async startRecording() {
+    console.log('Attempting to start segmented recording ...');
+    
+    // Start the first segment
+    this.startRecordingSegment();
+    
+    // Set up interval to create new segments every minute
+    this.segmentInterval = setInterval(() => {
+      this.rotateRecordingSegment();
+    }, 60000); // 60 seconds
+  }
 
-    console.log('Attempting to start the recording ... @', this.getRecordingPath());
-    if (this.ffmpegProcess) return console.log('Recording already started.');
+  /**
+   * Starts recording a single segment
+   */
+  private async startRecordingSegment() {
+    const segmentPath = this.getCurrentSegmentPath();
+    console.log(`Starting recording segment ${this.currentSegment} @ ${segmentPath}`);
+    
+    if (this.ffmpegProcess) {
+      console.log('Stopping previous segment...');
+      this.ffmpegProcess.kill('SIGINT');
+      this.ffmpegProcess = null;
+    }
 
     this.ffmpegProcess = spawn('ffmpeg', this.getFFmpegParams());
+    console.log('Spawned segment recording subprocess: pid=', this.ffmpegProcess.pid);
 
-    console.log('Spawned a subprocess to record: pid=', this.ffmpegProcess.pid);
-
-    // Report any data / errors (DEBUG, since it also prints that data is available).
+    // Report any data / errors
     this.ffmpegProcess.stderr.on('data', (data) => {
-      // console.error(`ffmpeg: ${data}`);
-
       // Log that we got data, and the recording started.
       if (!this.startedRecording) {
-        console.log('Recording Started.');
+        console.log(`Recording segment ${this.currentSegment} started.`);
         this.startedRecording = true;
       }
     });
 
-    // Log Output of stderr
-    // Log to console if the env var is set
-    // Turn it on if ffmpeg gives a weird error code.
+    // Log Output of stderr if debugging is enabled
     const logFfmpeg = process.env.MEET_FFMPEG_STDERR_ECHO === 'true'
     if (logFfmpeg ?? false) {
       this.ffmpegProcess.stderr.on('data', (data) => {
@@ -419,64 +445,152 @@ export class MeetsBot extends Bot {
       });
     }
 
-    // Report when the process exits
+    // Handle segment completion
     this.ffmpegProcess.on('exit', (code) => {
-      console.log(`ffmpeg exited with code ${code}`);
+      console.log(`Recording segment ${this.currentSegment} completed with code ${code}`);
+      
+      // Add completed segment to list
+      if (code === 0) {
+        this.recordingSegments.push(this.getCurrentSegmentPath());
+        console.log(`Segment ${this.currentSegment} saved: ${this.getCurrentSegmentPath()}`);
+      }
+      
       this.ffmpegProcess = null;
     });
 
-    console.log('Started FFMPEG Process.')
+    console.log(`Started FFMPEG Process for segment ${this.currentSegment}.`)
   }
 
   /**
-   * Stops the ongoing recording if it has been started.
+   * Rotates to the next recording segment
+   */
+  private async rotateRecordingSegment() {
+    console.log(`Rotating to next segment (current: ${this.currentSegment})`);
+    
+    // Stop current recording process
+    if (this.ffmpegProcess) {
+      this.ffmpegProcess.kill('SIGINT');
+    }
+    
+    // Wait a moment for the process to exit
+    await setTimeout(1000);
+    
+    // Move to next segment
+    this.currentSegment++;
+    
+    // Start new segment
+    this.startRecordingSegment();
+  }
+
+  /**
+   * Stops the ongoing segmented recording and merges all segments into a final file.
    * 
-   * This function ensures that the recording process is terminated. It checks if the `ffmpegProcess`
-   * exists and, if so, sends a termination signal to stop the recording. If no recording process
-   * is active, it logs a message indicating that no recording was in progress.
-   * 
-   * @returns {Promise<number>} - Returns 0 if the recording was successfully stopped.
+   * @returns {Promise<number>} - Returns 0 if the recording was successfully stopped and merged.
    */
   async stopRecording() {
+    console.log('Attempting to stop segmented recording ...');
 
-    console.log('Attempting to stop the recording ...');
+    // Stop the segment interval
+    if (this.segmentInterval) {
+      clearInterval(this.segmentInterval);
+      this.segmentInterval = null;
+    }
 
-    // Await encoding result
-    const promiseResult = await new Promise((resolve) => {
-
-      // No recording
+    // Stop current recording process
+    const promiseResult = await new Promise<number>((resolve) => {
       if (!this.ffmpegProcess) {
         console.log('No recording in progress, cannot end recording.');
         resolve(1);
-        return; // exit early
+        return;
       }
 
-      // Graceful stop
-      console.log('Killing ffmpeg process gracefully ...');
-      this.ffmpegProcess.kill('SIGINT'); 
-      console.log('Waiting for ffmpeg to finish encoding ...');
+      console.log('Killing current segment ffmpeg process gracefully ...');
+      this.ffmpegProcess.kill('SIGINT');
+      console.log('Waiting for current segment to finish encoding ...');
 
-      // Modify the exit handler to resolve the promise.
-      // This will be called when the video is done encoding
       this.ffmpegProcess.on('exit', (code, signal) => {
         if (code === 0) {
-          console.log('Recording stopped and file finalized.');
+          console.log('Current segment stopped and file finalized.');
+          // Add the final segment to the list
+          this.recordingSegments.push(this.getCurrentSegmentPath());
           resolve(0);
         } else {
           console.error(`FFmpeg exited with code ${code}${signal ? ` and signal ${signal}` : ''}`);
           resolve(1);
         }
       });
-  
-      // Modify the error handler to resolve the promise.
+
       this.ffmpegProcess.on('error', (err) => {
         console.error('Error while stopping ffmpeg:', err);
         resolve(1);
       });
     });
 
-    // Continue
+    // Merge all segments if we have any
+    if (this.recordingSegments.length > 0) {
+      console.log(`Merging ${this.recordingSegments.length} recording segments...`);
+      await this.mergeSegments();
+    }
+
     return promiseResult;
+  }
+
+  /**
+   * Merges all recording segments into a single final MP3 file
+   */
+  private async mergeSegments(): Promise<void> {
+    const finalPath = this.getRecordingPath();
+    const validSegments = this.recordingSegments.filter(segment => fs.existsSync(segment));
+    
+    if (validSegments.length === 0) {
+      console.log('No valid segments to merge.');
+      return;
+    }
+
+    console.log(`Merging ${validSegments.length} segments into ${finalPath}`);
+
+    // Create a file list for ffmpeg concat
+    const listFilePath = path.join(path.dirname(finalPath), 'segments.txt');
+    const listContent = validSegments.map(segment => `file '${segment}'`).join('\n');
+    fs.writeFileSync(listFilePath, listContent);
+
+    return new Promise<void>((resolve, reject) => {
+      const mergeProcess = spawn('ffmpeg', [
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', listFilePath,
+        '-c', 'copy',
+        '-y', finalPath
+      ]);
+
+      mergeProcess.on('exit', (code) => {
+        // Clean up
+        if (fs.existsSync(listFilePath)) {
+          fs.unlinkSync(listFilePath);
+        }
+
+        if (code === 0) {
+          console.log(`Successfully merged segments into ${finalPath}`);
+          // Clean up segment files
+          validSegments.forEach(segment => {
+            if (fs.existsSync(segment)) {
+              fs.unlinkSync(segment);
+              console.log(`Cleaned up segment: ${segment}`);
+            }
+          });
+          resolve();
+        } else {
+          console.error(`Failed to merge segments. FFmpeg exited with code ${code}`);
+          reject(new Error(`Merge failed with code ${code}`));
+        }
+      });
+
+      mergeProcess.stderr.on('data', (data) => {
+        if (process.env.MEET_FFMPEG_STDERR_ECHO === 'true') {
+          console.error(`merge ffmpeg stderr: ${data}`);
+        }
+      });
+    });
   }
 
   async screenshot(fName: string = 'screenshot.png') {
